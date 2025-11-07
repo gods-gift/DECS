@@ -1,172 +1,98 @@
-# KV Server (C++ • HTTP • Cache • Persistent DB)
+# KV Server (C++): HTTP Key–Value store with Cache, DB & Load Generator
 
-A multi-threaded HTTP key–value store in C++ with:
+A multi-threaded HTTP key–value store with:
 
-* **HTTP server** (cpp-httplib)
-* **In-memory LRU cache**
-* **Persistent DB** (SQLite by default; pluggable)
-* **Closed-loop load generator**
-* **Tiny C++ client**
+* **REST API** for CRUD
+* **In-memory LRU cache** for hot data
+* **SQLite** persistent storage (WAL, prepared statements)
+* **Client CLI** and **closed-loop load generator**
+* **Tests** for cache, DB, and server routes
 
-Designed to demonstrate CPU- vs I/O-bound workloads, caching effectiveness, and end-to-end performance.
-
----
-
-## Project Layout
-
-```
-kv-server/
-├── CMakeLists.txt
-├── README.md
-├── config/
-│   └── server_config.json
-├── include/
-│   ├── cache.h
-│   ├── config.h
-│   ├── database.h
-│   ├── load_generator.h
-│   ├── server.h
-│   └── utils.h
-├── src/
-│   ├── main.cpp              # server entrypoint (HAS int main)
-│   ├── server.cpp
-│   ├── cache.cpp
-│   ├── database.cpp
-│   ├── config.cpp
-│   └── utils.cpp
-├── client/
-│   └── client.cpp            # client entrypoint (HAS int main)
-├── loadgen/
-│   ├── loadgen_main.cpp      # loadgen entrypoint (HAS int main)
-│   └── load_generator.cpp    # helpers (NO main)
-├── tests/
-│   ├── test_cache.cpp        # has its own main (or gtest_main)
-│   ├── test_database.cpp     # has its own main (or gtest_main)
-│   └── test_server.cpp       # has its own main (or gtest_main)
-├── logs/
-│   └── .gitkeep
-├── scripts/
-│   ├── run_server.sh
-│   └── run_loadgen.sh
-├── build/                    # generated
-└── kv_store.db               # generated (SQLite)
-```
-
-> **Important:** exactly three entrypoints define `int main(...)`:
-> `src/main.cpp`, `client/client.cpp`, `loadgen/loadgen_main.cpp`.
-> Test files must have their own `main` (or link a test framework’s `*_main`).
+This README is the up-to-date “how to build, run, test, and load-test” guide.
 
 ---
 
-## Requirements
+## 1) Requirements
 
-* CMake ≥ 3.16
-* C++17 compiler (GCC/Clang/MSVC)
-* SQLite3 dev package
-
-  * Ubuntu/Debian: `sudo apt-get install libsqlite3-dev`
-  * macOS: `brew install sqlite`
-* Internet access (CMake `FetchContent` grabs header-only deps)
-
-Optional:
-
-* OpenSSL (if `-DENABLE_SSL=ON`)
-* PostgreSQL/MySQL dev packages (if you switch backends)
-
----
-
-## Build
-
-SQLite (default):
+Ubuntu/Debian (others similar):
 
 ```bash
-cmake -S . -B build -DUSE_SQLITE=ON -DBUILD_TESTS=ON
-cmake --build build -j
-```
-
-Switch DB backends:
-
-```bash
-# PostgreSQL
-cmake -S . -B build -DUSE_SQLITE=OFF -DUSE_POSTGRES=ON
-cmake --build build -j
-
-# MySQL
-cmake -S . -B build -DUSE_SQLITE=OFF -DUSE_MYSQL=ON
-cmake --build build -j
-```
-
-Sanitizers (Linux/macOS):
-
-```bash
-cmake -S . -B build -DENABLE_SANITIZERS=ON
-cmake --build build -j
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config libsqlite3-dev curl
+# For utilization tools (recommended for bottleneck proof)
+sudo apt-get install -y sysstat
+# For plotting (optional)
+sudo apt-get install -y python3-matplotlib
 ```
 
 ---
 
-## Run
+## 2) Build
 
-Start the server:
+Release build (recommended for load tests):
+
+```bash
+cd ~/Desktop/DECS/kv-server
+rm -rf build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+### What gets built
+
+* `build/kv-server` – server
+* `build/kv-client` – simple client
+* `build/kv-loadgen` – load generator
+* Tests (when `BUILD_TESTS=ON`): `test-cache`, `test-database`, `test-server`
+
+> We use header-only deps via CMake `FetchContent`: **cpp-httplib** and **nlohmann/json**.
+> DB backend macro `DB_BACKEND_SQLITE` is enabled by default.
+
+---
+
+## 3) Configuration
+
+Edit `config/server_config.json` (or set `KV_SERVER_CONFIG` env var):
+
+```json
+{
+  "server_port": 8080,
+  "cache_size": 20000,
+  "database_path": "kv_store.db",
+  "log_level": "ERROR",
+  "thread_pool_size": 16
+}
+```
+
+* `cache_size` controls hot-set fit (bigger → more hits/CPU-bound).
+* `log_level`: `TRACE|DEBUG|INFO|WARN|ERROR|OFF`.
+
+---
+
+## 4) Run the server
 
 ```bash
 ./build/kv-server
+# (or override config quickly)
+./build/kv-server --port 8080 --cache-size 20000 --threads 16 --db kv_store.db
 ```
 
-* Default port: `8080`
-* Default DB: `kv_store.db`
-* Healthcheck: `GET /health` → `OK`
-
-Run the client:
+Health check:
 
 ```bash
-./build/kv-client
+curl http://localhost:8080/health
 ```
-
-Run the load generator:
-
-```bash
-./build/kv-loadgen \
-  --host localhost --port 8080 \
-  --clients 32 --duration 30s \
-  --workload get-popular --keys 100 \
-  --put-ratio 0.1 --delete-ratio 0.05
-```
-
-*(If you haven’t added CLI parsing yet, it’ll run with built-in defaults.)*
 
 ---
 
-## API
+## 5) REST API
 
-### Create / Update
+* `GET /health` → `200 OK`
+* `GET /get/{key}` → `200 value` or `404`
+* `POST /put/{key}/{value}` → `200` (upsert; updates DB then cache)
+* `DELETE /delete/{key}` → `200` if deleted, `404` if missing
 
-```
-POST /put/{key}/{value}
-```
-
-* Writes to DB + cache
-* `200 OK` on success
-
-### Read
-
-```
-GET /get/{key}
-```
-
-* Cache first; on miss, fetch from DB and populate cache
-* `200 OK` with value (text/plain), or `404 Not Found`
-
-### Delete
-
-```
-DELETE /delete/{key}
-```
-
-* Delete from DB; evict from cache if present
-* `200 OK` (even if only in DB), `404 Not Found` if absent
-
-**cURL examples**
+Examples:
 
 ```bash
 curl -X POST "http://localhost:8080/put/user123/hello"
@@ -174,145 +100,265 @@ curl "http://localhost:8080/get/user123"
 curl -X DELETE "http://localhost:8080/delete/user123"
 ```
 
-> For arbitrary payloads, add JSON endpoints later instead of path params.
-
 ---
 
-## Configuration
+## 6) Client CLI
 
-`config/server_config.json`:
+From **repo root**:
 
-```json
-{
-  "server_port": 8080,
-  "cache_size": 100,
-  "database_path": "kv_store.db",
-  "log_level": "INFO",
-  "thread_pool_size": 8
-}
+```bash
+./build/kv-client health
+./build/kv-client put user123 hello
+./build/kv-client get user123
+./build/kv-client delete user123
 ```
 
-Compile-time fallbacks (CMake options):
+---
 
-* `-DDEFAULT_SERVER_PORT=8080`
-* `-DDEFAULT_CACHE_CAPACITY=100`
+## 7) Load Generator
+
+Closed-loop threads; supports multiple workloads.
+
+```
+./build/kv-loadgen --host localhost --port 8080 \
+  --clients 128 --duration 120s \
+  --workload get-popular --keys 500
+```
+
+**Workloads**
+
+* `put-all` – writes only (DB write-heavy, I/O-bound)
+* `get-all` – reads unique keys (forced cache misses, I/O-bound)
+* `get-popular` – small hot set (cache hits, CPU/memory-bound)
+* `mixed` – tunable: `--put-ratio`, `--delete-ratio`, rest are GETs
+
+Common args:
+
+* `--clients N` concurrent threads
+* `--duration 30s|300s|…`
+* `--timeout-ms 3000`
+* `--keys N` (size of hot set for `get-popular`/`mixed`)
+* `--put-ratio`, `--delete-ratio` (for `mixed`)
+
+Reports (stdout):
+
+* `requests_ok`, `requests_fail`
+* `throughput (req/s)`
+* `avg latency (ms)`, `p50/p95/p99`
 
 ---
 
-## Data Flow (TL;DR)
+## 8) How it works (data flow)
 
-1. **Client → Server** (cpp-httplib router)
-2. **Cache (LRU)**
+* **PUT**: DB upsert (prepared statement) → update cache (LRU) → `200`.
+* **GET**: check cache → hit → `200`; miss → DB select → (if found) cache insert → `200` else `404`.
+* **DELETE**: DB delete authoritative → erase from cache if present → `200` or `404`.
 
-   * GET hit → return
-   * miss → **DB read**, then insert to cache (evict LRU if needed)
-3. **DB**
+Thread safety:
 
-   * POST upsert in DB, update cache
-   * DELETE in DB, invalidate cache
-4. **Respond** with proper status/body
-5. **Loadgen** measures latency & throughput
+* Cache protected by a mutex (O(1) ops).
+* SQLite single connection + mutex, WAL mode, `busy_timeout=5s`.
 
 ---
 
-## Workloads & Bottlenecks
+## 9) Proving CPU-bound vs I/O-bound (what to run & what to observe)
 
-* **I/O-bound**: `put-all`, `get-all` (many DB ops, low cache hit)
-* **CPU/Mem-bound**: `get-popular` (hotset, high cache hit)
-* **Mixed**: `mixed` with ratios (`--put-ratio`, `--delete-ratio`)
+Open 3 terminals to **monitor** while you run loads:
 
-Use these to study:
+**Find server PID**
 
-* Cache hit rate vs latency
-* Thread pool sizing
-* DB tuning (WAL, sync, indexes, pooling)
+```bash
+SERVER_PID=$(pgrep -n kv-server); echo "$SERVER_PID"
+```
+
+**CPU per core (Terminal A)**
+
+```bash
+mpstat -P ALL 1
+```
+
+**Disk I/O (Terminal B)**
+
+```bash
+iostat -dx 1
+```
+
+**Server process stats (Terminal C)**
+
+```bash
+pidstat -r -u -d -h -p "$SERVER_PID" 1
+```
+
+### CPU-bound proof (cache-hit heavy)
+
+Start server with a **large cache** (already done in config), then:
+
+```bash
+./build/kv-loadgen --clients 128 --duration 120s --workload get-popular --keys 500
+```
+
+Expect:
+
+* `mpstat`: `%usr+%sys` high (busy cores), `%iowait` low
+* `iostat`: disk `%util` low, `await` low
+* `pidstat`: high `%CPU`, tiny `kB_rd/s` & `kB_wr/s`
+* Loadgen: high throughput, low latency
+
+### I/O-bound proof (DB-heavy)
+
+Option A (writes):
+
+```bash
+./build/kv-loadgen --clients 64 --duration 120s --workload put-all
+```
+
+Option B (miss reads):
+
+```bash
+./build/kv-loadgen --clients 64 --duration 120s --workload get-all
+```
+
+Expect:
+
+* `iostat`: `%util` high (70–100%), `await` higher (ms→tens of ms)
+* `mpstat`: `%iowait` noticeable; CPU not saturated
+* `pidstat`: large `kB_wr/s` (put-all) **or** large `kB_rd/s` (get-all)
+* Loadgen: lower throughput; rising tail latencies
+
+> Make writes more I/O-bound (optional): in `src/database.cpp`, set `PRAGMA synchronous=FULL;` and rebuild.
 
 ---
 
-## Testing
+## 10) Full load-testing matrix (for your report)
+
+Run **≥5 client levels** for **≥5 minutes** per workload.
+
+Example:
+
+```bash
+# CPU-bound series
+for C in 8 16 32 64 128; do
+  ./build/kv-loadgen --clients $C --duration 300s --workload get-popular --keys 500
+done
+
+# I/O-bound series
+for C in 8 16 32 64 128; do
+  ./build/kv-loadgen --clients $C --duration 300s --workload put-all
+done
+```
+
+Capture monitors during runs:
+
+```bash
+mkdir -p results
+mpstat -P ALL 5   > results/mpstat.txt &
+iostat -dx 5      > results/iostat.txt &
+pidstat -r -u -d -h -p "$SERVER_PID" 5 > results/pidstat.txt &
+# kill them with `kill <pid>` when done (use `jobs -l` to see pids)
+```
+
+**What to include in deliverables**
+
+* Plots: **Throughput vs Clients** and **Avg Latency vs Clients** (per workload)
+* Capacity estimate (plateau point; where latency curve bends up)
+* Bottleneck analysis with evidence:
+
+  * CPU-bound: high CPU, low disk util
+  * I/O-bound: high disk util/await, moderate CPU, high rd/wr rates
+* (Optional) cache hit rate if you add a `/metrics` endpoint
+
+### Optional plotting script
+
+If you used the CSV script earlier, you can generate graphs with:
+
+```bash
+python3 scripts/plot_results.py results/summary_*.csv
+```
+
+---
+
+## 11) Tests
 
 Build with tests:
 
 ```bash
-cmake -S . -B build -DBUILD_TESTS=ON
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+rm -rf build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+cmake --build build -j"$(nproc)"
+cd build
+ctest --output-on-failure
 ```
 
-Test targets:
-
-* `test-cache`       — LRU correctness
-* `test-database`    — CRUD against selected backend
-* `test-server`      — HTTP endpoint behaviors
-
-> If you use a framework (e.g., GoogleTest), link `gtest_main` and drop your own mains.
+* `test-cache` – LRU behavior, eviction, erase
+* `test-database` – CRUD & upsert on SQLite
+* `test-server` – starts HTTP server; hits CRUD routes
 
 ---
 
-## Troubleshooting
+## 12) Troubleshooting
 
-**`undefined reference to 'main'` during link**
+* **`httplib.h` not found**
+  Ensure CMake added its include dir; our `CMakeLists.txt` sets:
 
-* Ensure each binary includes a file **that defines `int main(...)`**:
+  * `FetchContent_MakeAvailable(httplib)`
+  * `target_include_directories(<targets> SYSTEM PRIVATE ${httplib_SOURCE_DIR})`
 
-  * `kv-server`: `src/main.cpp`
-  * `kv-client`: `client/client.cpp`
-  * `kv-loadgen`: `loadgen/loadgen_main.cpp`
-* Don’t accidentally add `src/main.cpp` to test targets (or vice versa).
+* **IntelliSense shows `#error "Define one DB backend"`**
+  CMake defines `DB_BACKEND_SQLITE` at build time. Point VS Code to compile commands:
+  `C_Cpp.default.compileCommands = ${workspaceFolder}/build/compile_commands.json`
+  Or add a fallback define for IntelliSense only.
 
-Quick check:
+* **Multiple `main` errors**
+  Ensure only these files contain `main()`:
 
-```bash
-grep -R --line-number "int main" src client loadgen tests || echo "no mains found"
+  * `src/main.cpp`, `client/client.cpp`, `loadgen/loadgen_main.cpp`, `tests/*.cpp` (test mains)
+
+* **No binaries when running from `build/`**
+  Use `./kv-server`, `./kv-client`, `./kv-loadgen` (drop the extra `build/` prefix if already inside `build/`).
+
+* **Monitors missing**
+  Install `sysstat`: `sudo apt-get install -y sysstat`.
+
+---
+
+## 13) Project layout (abridged)
+
+```
+.
+├── CMakeLists.txt
+├── config/
+│   └── server_config.json
+├── include/
+│   ├── cache.h
+│   ├── config.h
+│   ├── database.h
+│   ├── server.h
+│   ├── utils.h
+│   └── load_generator.h
+├── src/
+│   ├── cache.cpp
+│   ├── config.cpp
+│   ├── database.cpp
+│   ├── main.cpp
+│   ├── server.cpp
+│   └── utils.cpp
+├── client/
+│   └── client.cpp
+├── loadgen/
+│   ├── load_generator.cpp
+│   └── loadgen_main.cpp
+├── tests/
+│   ├── test_cache.cpp
+│   ├── test_database.cpp
+│   └── test_server.cpp
+└── scripts/ (optional helpers)
 ```
 
-**SQLite not found**
-
-* Install dev headers (`libsqlite3-dev`) and rerun CMake.
-* If needed, set hint vars (e.g., `-DSQLITE3_ROOT=/path`).
-
-**Windows link issues**
-
-* Ensure `ws2_32` is linked (handled by CMake in this repo).
-
-**High latency**
-
-* Increase `thread_pool_size`
-* For SQLite, enable WAL & tune `synchronous` in `database.cpp`
-* Increase cache size for hot workloads
-
 ---
 
-## Production Notes
+## 14) License & notes
 
-* Prefer JSON bodies for values (encoding, size).
-* Add request timeouts, rate limiting, access logs.
-* DB: WAL (SQLite), prepared statements, pooling (Pg/MySQL).
-* Metrics: basic `/metrics` endpoint or Prometheus integration.
+* The project uses **cpp-httplib** (MIT) and **nlohmann/json** (MIT).
+* SQLite is included via system packages.
 
----
-
-## License
-
-MIT (or your preference). Add a `LICENSE` file if open-sourcing.
-
----
-
-### Quick Start
-
-```bash
-# build
-cmake -S . -B build -DUSE_SQLITE=ON
-cmake --build build -j
-
-# run server
-./build/kv-server
-
-# try it
-curl -X POST "http://localhost:8080/put/hello/world"
-curl "http://localhost:8080/get/hello"
-curl -X DELETE "http://localhost:8080/delete/hello"
-
-# load test
-./build/kv-loadgen --clients 32 --duration 30s --workload get-popular --keys 100
-```
+If you want, I can also add an optional `/metrics` endpoint for live **cache hit/miss** counters, plus a tiny script that fetches and overlays hit rate on your plots.

@@ -1,0 +1,7 @@
+{
+  "server_port": 8080,
+  "cache_size": 1000,
+  "database_path": "kv_store.db",
+  "log_level": "INFO",
+  "thread_pool_size": 8
+}

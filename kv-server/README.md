@@ -361,4 +361,3 @@ ctest --output-on-failure
 * The project uses **cpp-httplib** (MIT) and **nlohmann/json** (MIT).
 * SQLite is included via system packages.
 
-If you want, I can also add an optional `/metrics` endpoint for live **cache hit/miss** counters, plus a tiny script that fetches and overlays hit rate on your plots.

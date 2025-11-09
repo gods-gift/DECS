@@ -1,4 +1,3 @@
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 cmake_minimum_required(VERSION 3.16)
 project(KVServer CXX)
 
@@ -28,6 +27,9 @@ else()
   endif()
 endif()
 
+# Export compile commands for IntelliSense (optional but helpful)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # ----------------------------- Dependencies ----------------------------
 include(FetchContent)
 find_package(Threads REQUIRED)
@@ -38,7 +40,7 @@ FetchContent_Declare(httplib
   GIT_TAG        v0.15.3
 )
 FetchContent_MakeAvailable(httplib)
-# expose the directory that contains httplib.h
+# dir that contains httplib.h
 set(HTTPLIB_INCLUDE_DIR ${httplib_SOURCE_DIR})
 
 # nlohmann/json (header-only)
@@ -78,13 +80,16 @@ set(SERVER_CORE_HDR
 
 # ----------------------------- kv-server -------------------------------
 add_executable(kv-server
-  src/main.cpp            # <-- has int main()
+  src/main.cpp            # has int main()
   ${SERVER_CORE_SRC}
   ${SERVER_CORE_HDR}
 )
-target_include_directories(kv-server PRIVATE
-  ${PROJ_INCLUDE_DIR}
-  ${HTTPLIB_INCLUDE_DIR}
+# mark httplib as SYSTEM to silence its warnings
+target_include_directories(kv-server
+  SYSTEM PRIVATE ${HTTPLIB_INCLUDE_DIR}
+)
+target_include_directories(kv-server
+  PRIVATE ${PROJ_INCLUDE_DIR}
 )
 target_link_libraries(kv-server PRIVATE
   Threads::Threads
@@ -104,11 +109,13 @@ target_compile_definitions(kv-server PRIVATE
 
 # ----------------------------- kv-client -------------------------------
 add_executable(kv-client
-  client/client.cpp       # <-- has int main()
+  client/client.cpp       # has int main()
 )
-target_include_directories(kv-client PRIVATE
-  ${PROJ_INCLUDE_DIR}
-  ${HTTPLIB_INCLUDE_DIR}
+target_include_directories(kv-client
+  SYSTEM PRIVATE ${HTTPLIB_INCLUDE_DIR}
+)
+target_include_directories(kv-client
+  PRIVATE ${PROJ_INCLUDE_DIR}
 )
 target_link_libraries(kv-client PRIVATE Threads::Threads)
 if (ENABLE_SSL)
@@ -120,7 +127,7 @@ endif()
 
 # ----------------------------- kv-loadgen ------------------------------
 add_executable(kv-loadgen
-  loadgen/loadgen_main.cpp   # <-- has int main()
+  loadgen/loadgen_main.cpp   # has int main()
   loadgen/load_generator.cpp
   src/utils.cpp
   src/config.cpp
@@ -128,9 +135,11 @@ add_executable(kv-loadgen
   ${PROJ_INCLUDE_DIR}/utils.h
   ${PROJ_INCLUDE_DIR}/config.h
 )
-target_include_directories(kv-loadgen PRIVATE
-  ${PROJ_INCLUDE_DIR}
-  ${HTTPLIB_INCLUDE_DIR}
+target_include_directories(kv-loadgen
+  SYSTEM PRIVATE ${HTTPLIB_INCLUDE_DIR}
+)
+target_include_directories(kv-loadgen
+  PRIVATE ${PROJ_INCLUDE_DIR}
 )
 target_link_libraries(kv-loadgen PRIVATE
   Threads::Threads
@@ -180,9 +189,11 @@ if (BUILD_TESTS)
     ${SERVER_CORE_SRC}
     ${SERVER_CORE_HDR}
   )
-  target_include_directories(test-server PRIVATE
-    ${PROJ_INCLUDE_DIR}
-    ${HTTPLIB_INCLUDE_DIR}
+  target_include_directories(test-server
+    SYSTEM PRIVATE ${HTTPLIB_INCLUDE_DIR}
+  )
+  target_include_directories(test-server
+    PRIVATE ${PROJ_INCLUDE_DIR}
   )
   target_link_libraries(test-server PRIVATE
     Threads::Threads

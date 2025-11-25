@@ -1,77 +1,68 @@
-// src/cache.cpp
 #include "cache.h"
 
-#include <cassert>
-#include <list>
-#include <string>
-#include <unordered_map>
-
-struct LRUCache::Impl {
-    struct Node {
-        std::string key;
-        std::string value;
-    };
-
-    explicit Impl(size_t cap)
-        : capacity(cap == 0 ? 1 : cap) {} // avoid zero capacity pathological case
-
-    // Doubly-linked list (front = most recently used)
-    std::list<Node> lru;
-    // Map key -> iterator into list
-    std::unordered_map<std::string, std::list<Node>::iterator> index;
-    size_t capacity;
-
-    inline void touch(std::list<Node>::iterator it) {
-        // Move the accessed node to the front (MRU)
-        lru.splice(lru.begin(), lru, it);
-    }
-};
-
-LRUCache::LRUCache(size_t cap)
-: pImpl_(new Impl(cap)) {}
-
-LRUCache::~LRUCache() = default;
+LRUCache::LRUCache(std::size_t capacity)
+    : capacity_(capacity)
+{
+}
 
 bool LRUCache::get(const std::string& key, std::string& value_out) {
-    auto it = pImpl_->index.find(key);
-    if (it == pImpl_->index.end()) return false;
-
-    auto list_it = it->second;
-    value_out = list_it->value;
-    pImpl_->touch(list_it);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = map_.find(key);
+    if (it == map_.end()) {
+        misses_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    touch(it->second);
+    value_out = it->second->second;
+    hits_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 void LRUCache::put(const std::string& key, const std::string& value) {
-    auto it = pImpl_->index.find(key);
-    if (it != pImpl_->index.end()) {
-        // Update existing & move to front
-        auto list_it = it->second;
-        list_it->value = value;
-        pImpl_->touch(list_it);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = map_.find(key);
+    if (it != map_.end()) {
+        it->second->second = value;
+        touch(it->second);
         return;
     }
+    lru_list_.emplace_front(key, value);
+    map_[key] = lru_list_.begin();
 
-    // Insert new at front
-    pImpl_->lru.push_front(Impl::Node{key, value});
-    pImpl_->index[key] = pImpl_->lru.begin();
-
-    // Evict if over capacity
-    if (pImpl_->index.size() > pImpl_->capacity) {
-        auto& tail = pImpl_->lru.back();
-        pImpl_->index.erase(tail.key);
-        pImpl_->lru.pop_back();
+    if (map_.size() > capacity_) {
+        auto last = lru_list_.end();
+        --last;
+        map_.erase(last->first);
+        lru_list_.pop_back();
     }
 }
 
-bool LRUCache::erase(const std::string& key) {
-    auto it = pImpl_->index.find(key);
-    if (it == pImpl_->index.end()) return false;
-    pImpl_->lru.erase(it->second);
-    pImpl_->index.erase(it);
-    return true;
+void LRUCache::erase(const std::string& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = map_.find(key);
+    if (it == map_.end()) return;
+    lru_list_.erase(it->second);
+    map_.erase(it);
 }
 
-size_t LRUCache::size() const {
-    return pImpl_->index.size();
+std::size_t LRUCache::size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return map_.size();
+}
+
+std::size_t LRUCache::hits() const {
+    return hits_.load(std::memory_order_relaxed);
+}
+
+std::size_t LRUCache::misses() const {
+    return misses_.load(std::memory_order_relaxed);
+}
+
+void LRUCache::reset_stats() {
+    hits_.store(0, std::memory_order_relaxed);
+    misses_.store(0, std::memory_order_relaxed);
+}
+
+void LRUCache::touch(ListIt it) {
+    lru_list_.splice(lru_list_.begin(), lru_list_, it);
 }

@@ -1,7 +1,8 @@
 {
   "server_port": 8080,
-  "cache_size": 1000,
-  "database_path": "kv_store.db",
+  "thread_pool_size": 8,
+  "cache_size": 2000,
   "log_level": "INFO",
-  "thread_pool_size": 8
+  "pg_conninfo": "host=127.0.0.1 port=5432 dbname=kvdb user=kvuser password=secret sslmode=disable",
+  "pg_pool_size": 4
 }

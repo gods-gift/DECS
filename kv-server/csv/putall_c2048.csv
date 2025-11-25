@@ -1,0 +1,2 @@
+timestamp,host,port,workload,clients,warmup_s,measure_s,keys,put_ratio,delete_ratio,seed,ok,fail,thr_rps,avg_ms,p50_ms,p95_ms,p99_ms,cpu_utilization,disk_read_MBps,disk_write_MBps
+1764067573,127.0.0.1,8080,put-all,2048,60,300,5000000,0.1,0,12345,18804,1141137,62.68,510.262,0.024719,2269.4,5881.19,10.0533,0.013099,1.89885

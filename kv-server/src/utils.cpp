@@ -1,112 +1,175 @@
-// src/utils.cpp
 #include "utils.h"
 
-#include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <atomic>    // <-- add this
+#include <cstring> 
+
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
-enum class Level { TRACE=0, DEBUG, INFO, WARN, ERROR, OFF };
+enum class LogLevel { TRACE = 0, DEBUG, INFO, WARN, ERROR, OFF };
 
-std::atomic<Level> g_level{Level::INFO};
+std::atomic<LogLevel> g_level{LogLevel::INFO};
 std::mutex g_log_mu;
 
-inline Level parse_level(const std::string& s) {
-    std::string t;
-    t.reserve(s.size());
-    for (char c : s) t.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    if (t == "TRACE") return Level::TRACE;
-    if (t == "DEBUG") return Level::DEBUG;
-    if (t == "INFO")  return Level::INFO;
-    if (t == "WARN" || t == "WARNING")  return Level::WARN;
-    if (t == "ERROR") return Level::ERROR;
-    if (t == "OFF" || t == "NONE") return Level::OFF;
-    return Level::INFO;
+LogLevel parse_level(const std::string& name) {
+    std::string s;
+    s.reserve(name.size());
+    for (char c : name) s.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    if (s == "TRACE") return LogLevel::TRACE;
+    if (s == "DEBUG") return LogLevel::DEBUG;
+    if (s == "INFO")  return LogLevel::INFO;
+    if (s == "WARN" || s == "WARNING") return LogLevel::WARN;
+    if (s == "ERROR") return LogLevel::ERROR;
+    if (s == "OFF")   return LogLevel::OFF;
+    return LogLevel::INFO;
 }
 
-inline const char* level_name(Level lv) {
-    switch (lv) {
-        case Level::TRACE: return "TRACE";
-        case Level::DEBUG: return "DEBUG";
-        case Level::INFO:  return "INFO";
-        case Level::WARN:  return "WARN";
-        case Level::ERROR: return "ERROR";
-        case Level::OFF:   return "OFF";
+const char* level_name(LogLevel lvl) {
+    switch (lvl) {
+        case LogLevel::TRACE: return "TRACE";
+        case LogLevel::DEBUG: return "DEBUG";
+        case LogLevel::INFO:  return "INFO";
+        case LogLevel::WARN:  return "WARN";
+        case LogLevel::ERROR: return "ERROR";
+        case LogLevel::OFF:   return "OFF";
     }
-    return "INFO";
+    return "?";
 }
 
-// Simple ANSI colors (can be disabled by setting NO_COLOR env if desired)
-inline const char* level_color(Level lv) {
-    switch (lv) {
-        case Level::TRACE: return "\x1b[90m"; // gray
-        case Level::DEBUG: return "\x1b[36m"; // cyan
-        case Level::INFO:  return "\x1b[32m"; // green
-        case Level::WARN:  return "\x1b[33m"; // yellow
-        case Level::ERROR: return "\x1b[31m"; // red
-        case Level::OFF:   return "\x1b[0m";
-    }
-    return "\x1b[0m";
-}
+void log_impl(LogLevel lvl, const std::string& msg) {
+    if (lvl < g_level.load(std::memory_order_relaxed) || lvl == LogLevel::OFF) return;
 
-inline std::string timestamp_now() {
-    using namespace std::chrono;
-    const auto now = system_clock::now();
-    const auto t   = system_clock::to_time_t(now);
-    const auto ms  = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    using clock = std::chrono::system_clock;
+    auto now = clock::now();
+    auto t   = clock::to_time_t(now);
+    auto tp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    long ms = static_cast<long>(tp_ms.count() % 1000);
 
-    std::tm tm_buf{};
+    std::tm tm;
 #if defined(_WIN32)
-    localtime_s(&tm_buf, &t);
+    localtime_s(&tm, &t);
 #else
-    localtime_r(&t, &tm_buf);
+    localtime_r(&t, &tm);
 #endif
 
     std::ostringstream oss;
-    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
-        << '.' << std::setw(3) << std::setfill('0') << ms.count();
-    return oss.str();
-}
-
-inline void log_impl(Level lv, const std::string& msg) {
-    if (lv < g_level.load()) return;
-
-    std::ostringstream line;
-    line << '[' << timestamp_now() << "] "
-         << level_name(lv) << " "
-         << "(tid:" << std::this_thread::get_id() << ") "
-         << msg;
-
-    const bool use_color =
-        std::getenv("NO_COLOR") == nullptr && std::getenv("CLICOLOR") != nullptr;
+    oss << "[" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+        << "." << std::setw(3) << std::setfill('0') << ms << "] "
+        << "[" << level_name(lvl) << "] "
+        << "[tid " << std::this_thread::get_id() << "] "
+        << msg;
 
     std::lock_guard<std::mutex> lk(g_log_mu);
-    std::ostream& out = (lv == Level::ERROR) ? std::cerr : std::clog;
-
-    if (use_color) {
-        out << level_color(lv) << line.str() << "\x1b[0m" << std::endl;
-    } else {
-        out << line.str() << std::endl;
-    }
+    std::cerr << oss.str() << "\n";
 }
 
 } // namespace
 
-// -------- Public API from utils.h --------------------------------------
-
 void log_set_level(const std::string& level_name_str) {
-    g_level.store(parse_level(level_name_str));
+    g_level.store(parse_level(level_name_str), std::memory_order_relaxed);
 }
 
-void log_trace(const std::string& msg) { log_impl(Level::TRACE, msg); }
-void log_debug(const std::string& msg) { log_impl(Level::DEBUG, msg); }
-void log_info (const std::string& msg) { log_impl(Level::INFO,  msg); }
-void log_warn (const std::string& msg) { log_impl(Level::WARN,  msg); }
-void log_error(const std::string& msg) { log_impl(Level::ERROR, msg); }
+void log_trace(const std::string& msg) { log_impl(LogLevel::TRACE, msg); }
+void log_debug(const std::string& msg) { log_impl(LogLevel::DEBUG, msg); }
+void log_info (const std::string& msg) { log_impl(LogLevel::INFO,  msg); }
+void log_warn (const std::string& msg) { log_impl(LogLevel::WARN,  msg); }
+void log_error(const std::string& msg) { log_impl(LogLevel::ERROR, msg); }
+
+// URL encode/decode (simple, enough for keys/values)
+std::string url_encode(const std::string& in) {
+    std::ostringstream oss;
+    oss << std::hex << std::uppercase;
+    for (unsigned char c : in) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            oss << c;
+        } else if (c == ' ') {
+            oss << '+';
+        } else {
+            oss << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+    }
+    return oss.str();
+}
+
+std::string url_decode(const std::string& in) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        char c = in[i];
+        if (c == '+') {
+            oss << ' ';
+        } else if (c == '%' && i + 2 < in.size()) {
+            int v = 0;
+            std::istringstream iss(in.substr(i + 1, 2));
+            iss >> std::hex >> v;
+            oss << static_cast<char>(v);
+            i += 2;
+        } else {
+            oss << c;
+        }
+    }
+    return oss.str();
+}
+
+bool set_process_affinity(const std::string& cpu_spec, std::string* err_msg) {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+
+    auto add_cpu = [&](int cpu) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE) {
+            if (err_msg) *err_msg = "CPU index out of range";
+            return false;
+        }
+        CPU_SET(cpu, &set);
+        return true;
+    };
+
+    std::string s = cpu_spec;
+    std::size_t start = 0;
+    while (start < s.size()) {
+        std::size_t comma = s.find(',', start);
+        std::string part = s.substr(start, comma == std::string::npos ? std::string::npos : (comma - start));
+
+        std::size_t dash = part.find('-');
+        if (dash == std::string::npos) {
+            int cpu = std::stoi(part);
+            if (!add_cpu(cpu)) return false;
+        } else {
+            int lo = std::stoi(part.substr(0, dash));
+            int hi = std::stoi(part.substr(dash + 1));
+            if (lo > hi) std::swap(lo, hi);
+            for (int c = lo; c <= hi; ++c) {
+                if (!add_cpu(c)) return false;
+            }
+        }
+
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        if (err_msg) *err_msg = "sched_setaffinity failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    return true;
+#else
+    (void)cpu_spec;
+    if (err_msg) *err_msg = "CPU affinity not supported on this platform";
+    return false;
+#endif
+}

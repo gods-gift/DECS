@@ -1,253 +1,408 @@
-// loadgen/load_generator.cpp
 #include "load_generator.h"
+#include "utils.h"
 
-#include <algorithm>
+#include <httplib.h>
+
 #include <atomic>
 #include <chrono>
-#include <cmath>
-#include <cctype>
 #include <cstdint>
-#include <functional>
-#include <httplib.h>
+#include <fstream>
+#include <iostream>
 #include <mutex>
-#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
 
 namespace {
 
-// Simple URL-encoder for path segments (keys/values)
-std::string url_encode(const std::string& s) {
-    static const char* hex = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(s.size() * 3);
-    for (unsigned char c : s) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            out.push_back(c);
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(c >> 4) & 0xF]);
-            out.push_back(hex[c & 0xF]);
-        }
-    }
-    return out;
-}
-
-// Percentile helper (expects v to be sorted ascending)
-static double percentile_ms(const std::vector<double>& v, double p /*0..100*/) {
-    const std::size_t n = v.size();
-    if (n == 0) return 0.0;
-    if (p <= 0.0)  return v.front();
-    if (p >= 100.0) return v.back();
-
-    const double idx = (p / 100.0) * static_cast<double>(n - 1);
-    const std::size_t lo = static_cast<std::size_t>(idx);
-    const std::size_t hi = std::min<std::size_t>(lo + 1, n - 1);
-    const double w = idx - static_cast<double>(lo);
-
+double pctl(std::vector<double>& v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    double idx = (p / 100.0) * static_cast<double>(v.size() - 1);
+    std::size_t lo = static_cast<std::size_t>(idx);
+    std::size_t hi = std::min(lo + 1, v.size() - 1);
+    double w = idx - static_cast<double>(lo);
     return v[lo] * (1.0 - w) + v[hi] * w;
 }
 
-
-struct ThreadStats {
-    uint64_t ok = 0;
-    uint64_t fail = 0;
-    std::vector<double> lat_ms; // per-request latency (ms)
-    ThreadStats() { lat_ms.reserve(4096); }
-};
-
 enum class Op { GET, PUT, DEL };
 
-struct OpSpec {
-    Op op;
-    std::string key;
-    std::string value; // for PUT
+// ---------- CPU & Disk sampling helpers (Linux /proc-based) ----------
+
+struct CpuSample {
+    unsigned long long user   = 0;
+    unsigned long long nice   = 0;
+    unsigned long long system = 0;
+    unsigned long long idle   = 0;
+    unsigned long long iowait = 0;
+    unsigned long long irq    = 0;
+    unsigned long long softirq= 0;
+    unsigned long long steal  = 0;
 };
 
-// Operation generators for each workload
-class OpGenerator {
-public:
-    OpGenerator(const Settings& s, uint32_t seed, int thread_id)
-      : S(s),
-        rng(seed ^ (0x9E3779B9u + static_cast<uint32_t>(thread_id) + (seed<<6) + (seed>>2))),
-        pick01(0.0, 1.0),
-        pick_key(0, std::max(1, S.popular_keys) - 1),
-        pick_big(0, 1'000'000'000) {}
+// Read stats for *core 0 only* (line "cpu0" in /proc/stat)
+bool read_cpu_sample(CpuSample& s) {
+    std::ifstream f("/proc/stat");
+    if (!f) return false;
 
-    // Unique-ish key per call
-    std::string next_unique_key() {
-        // large space to avoid collisions across threads
-        return "k" + std::to_string(pick_big(rng));
-    }
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string label;
+        iss >> label;
 
-    std::string next_popular_key() {
-        int k = pick_key(rng);
-        return "hot" + std::to_string(k);
-    }
-
-    std::string random_value() {
-        // small value payload; extend if you want to test larger bodies
-        return "v" + std::to_string(pick_big(rng) & 0xFFFF);
-    }
-
-    OpSpec next_put_all() {
-        return {Op::PUT, next_unique_key(), random_value()};
-    }
-
-    OpSpec next_get_all() {
-        // force cache miss tendencies with unique keys
-        return {Op::GET, next_unique_key(), {}};
-    }
-
-    OpSpec next_get_popular() {
-        // repeatedly hit small hot set
-        return {Op::GET, next_popular_key(), {}};
-    }
-
-    OpSpec next_mixed() {
-        double r = pick01(rng);
-        if (r < S.put_ratio) {
-            return {Op::PUT, next_popular_key(), random_value()};
-        } else if (r < S.put_ratio + S.delete_ratio) {
-            return {Op::DEL, next_popular_key(), {}};
-        } else {
-            // reads dominate
-            // Mix unique & popular reads to exercise both miss and hit paths
-            return (pick01(rng) < 0.7)
-                ? OpSpec{Op::GET, next_popular_key(), {}}
-                : OpSpec{Op::GET, next_unique_key(), {}};
-        }
-    }
-
-private:
-    const Settings& S;
-    std::mt19937_64 rng;
-    std::uniform_real_distribution<double> pick01;
-    std::uniform_int_distribution<int>    pick_key;
-    std::uniform_int_distribution<int>    pick_big;
-};
-
-bool perform_request(httplib::Client& cli, const OpSpec& spec) {
-    // Routes expected by the server:
-    //   GET    /get/{key}
-    //   POST   /put/{key}/{value}   (also sends body=text/plain)
-    //   DELETE /delete/{key}
-    switch (spec.op) {
-        case Op::GET: {
-            auto path = "/get/" + url_encode(spec.key);
-            if (auto res = cli.Get(path.c_str())) {
-                // Treat 200 and 404 as "handled"
-                return res->status == 200 || res->status == 404;
-            }
-            return false;
-        }
-        case Op::PUT: {
-            auto path = "/put/" + url_encode(spec.key) + "/" + url_encode(spec.value);
-            if (auto res = cli.Post(path.c_str(), spec.value, "text/plain")) {
-                return res->status == 200;
-            }
-            return false;
-        }
-        case Op::DEL: {
-            auto path = "/delete/" + url_encode(spec.key);
-            if (auto res = cli.Delete(path.c_str())) {
-                // 200 or 404 both acceptable (idempotent-ish)
-                return res->status == 200 || res->status == 404;
-            }
-            return false;
+        if (label == "cpu0") {
+            iss >> s.user >> s.nice >> s.system >> s.idle >> s.iowait
+                >> s.irq >> s.softirq >> s.steal;
+            return true;
         }
     }
     return false;
 }
 
-} // namespace
+double cpu_utilization(const CpuSample& a, const CpuSample& b) {
+    auto idle_a  = a.idle + a.iowait;
+    auto idle_b  = b.idle + b.iowait;
+    auto total_a = a.user + a.nice + a.system + a.idle + a.iowait +
+                   a.irq + a.softirq + a.steal;
+    auto total_b = b.user + b.nice + b.system + b.idle + b.iowait +
+                   b.irq + b.softirq + b.steal;
 
-Result run(const Settings& S) {
-    using clock = std::chrono::steady_clock;
+    double totald = static_cast<double>(total_b - total_a);
+    double idled  = static_cast<double>(idle_b - idle_a);
+    if (totald <= 0.0) return 0.0;
+    return 100.0 * (1.0 - idled / totald);
+}
 
-    const auto t_start = clock::now();
-    const auto t_end   = t_start + std::chrono::seconds(std::max(1, S.duration_seconds));
+struct DiskSample {
+    unsigned long long read_sectors  = 0;
+    unsigned long long write_sectors = 0;
+};
 
-    std::atomic<uint64_t> total_ok{0}, total_fail{0};
-    std::mutex             lat_merge_mu;
-    std::vector<double>    all_lat_ms; all_lat_ms.reserve(static_cast<size_t>(S.clients) * 2048);
+// Aggregate sectors read/written across all non-loop, non-ram devices
+bool read_disk_sample(DiskSample& s) {
+    std::ifstream f("/proc/diskstats");
+    if (!f) return false;
 
-    auto worker = [&](int tid) {
-        ThreadStats stats;
+    std::string line;
+    unsigned long long total_read = 0;
+    unsigned long long total_write = 0;
 
-        httplib::Client cli(S.host, S.port);
-        // timeouts
-        cli.set_connection_timeout(S.timeout_ms / 1000, (S.timeout_ms % 1000) * 1000);
-        cli.set_read_timeout(S.timeout_ms / 1000, (S.timeout_ms % 1000) * 1000);
-        cli.set_write_timeout(S.timeout_ms / 1000, (S.timeout_ms % 1000) * 1000);
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        unsigned long long major = 0, minor = 0;
+        std::string name;
+        if (!(iss >> major >> minor >> name)) continue;
 
-        OpGenerator gen(S, S.seed, tid);
+        // Skip loopback / ram devices
+        if (name.rfind("loop", 0) == 0 || name.rfind("ram", 0) == 0) continue;
 
-        auto pick_op = [&](WorkloadType w)->OpSpec {
-            switch (w) {
-                case WorkloadType::PutAll:     return gen.next_put_all();
-                case WorkloadType::GetAll:     return gen.next_get_all();
-                case WorkloadType::GetPopular: return gen.next_get_popular();
-                case WorkloadType::Mixed:      return gen.next_mixed();
-            }
-            return gen.next_get_popular();
-        };
+        unsigned long long rd_ios = 0, rd_merges = 0, rd_sectors = 0, rd_ticks = 0;
+        unsigned long long wr_ios = 0, wr_merges = 0, wr_sectors = 0, wr_ticks = 0;
 
-        while (clock::now() < t_end) {
-            OpSpec spec = pick_op(S.workload);
-            auto t0 = clock::now();
-            bool ok = perform_request(cli, spec);
-            auto t1 = clock::now();
-            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-            if (ok) { ++stats.ok; } else { ++stats.fail; }
-            stats.lat_ms.push_back(ms);
-            // closed loop: send next only after response (no think time)
+        if (!(iss >> rd_ios >> rd_merges >> rd_sectors >> rd_ticks
+                  >> wr_ios >> wr_merges >> wr_sectors >> wr_ticks)) {
+            continue;
         }
 
-        total_ok  += stats.ok;
-        total_fail += stats.fail;
+        total_read  += rd_sectors;
+        total_write += wr_sectors;
+    }
 
-        // Merge latencies
-        {
-            std::lock_guard<std::mutex> lk(lat_merge_mu);
-            all_lat_ms.insert(all_lat_ms.end(),
-                              std::make_move_iterator(stats.lat_ms.begin()),
-                              std::make_move_iterator(stats.lat_ms.end()));
+    s.read_sectors  = total_read;
+    s.write_sectors = total_write;
+    return true;
+}
+
+void compute_disk_rates(const DiskSample& a, const DiskSample& b,
+                        double seconds,
+                        double& read_MBps,
+                        double& write_MBps) {
+    if (seconds <= 0.0) {
+        read_MBps = write_MBps = 0.0;
+        return;
+    }
+
+    constexpr double sector_size = 512.0; // bytes
+    double read_bytes  = static_cast<double>(b.read_sectors  - a.read_sectors)  * sector_size;
+    double write_bytes = static_cast<double>(b.write_sectors - a.write_sectors) * sector_size;
+
+    read_MBps  = (read_bytes  / (1024.0 * 1024.0)) / seconds;
+    write_MBps = (write_bytes / (1024.0 * 1024.0)) / seconds;
+
+    if (read_MBps  < 0.0) read_MBps  = 0.0;
+    if (write_MBps < 0.0) write_MBps = 0.0;
+}
+
+} // namespace
+
+LoadGenConfig parse_loadgen_args(int argc, char** argv) {
+    LoadGenConfig cfg;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto next = [&](int& i) -> const char* {
+            if (i + 1 >= argc) throw std::runtime_error("Missing value for " + arg);
+            return argv[++i];
+        };
+
+        if (arg == "--host")        cfg.host      = next(i);
+        else if (arg == "--port")   cfg.port      = std::stoi(next(i));
+        else if (arg == "--clients")cfg.clients   = std::stoi(next(i));
+        else if (arg == "--warmup") cfg.warmup_s  = std::stoi(next(i));
+        else if (arg == "--measure")cfg.measure_s = std::stoi(next(i));
+        else if (arg == "--workload")cfg.workload = next(i);
+        else if (arg == "--keys")   cfg.keys      = static_cast<std::size_t>(std::stoull(next(i)));
+        else if (arg == "--put-ratio") cfg.put_ratio = std::stod(next(i));
+        else if (arg == "--delete-ratio") cfg.delete_ratio = std::stod(next(i));
+        else if (arg == "--seed")   cfg.seed      = std::stoull(next(i));
+        else if (arg == "--csv")    cfg.csv_file  = next(i);
+        else if (arg == "--help" || arg == "-h") {
+            std::cout
+                << "kv-loadgen options:\n"
+                << "  --host <ip>           Server host (default 127.0.0.1)\n"
+                << "  --port <n>            Server port (default 8080)\n"
+                << "  --clients <n>         Number of client threads\n"
+                << "  --warmup <s>          Warmup seconds (not measured)\n"
+                << "  --measure <s>         Measurement seconds\n"
+                << "  --workload <type>     get-popular|get-all|put-all|mixed\n"
+                << "  --keys <n>            Number of distinct keys\n"
+                << "  --put-ratio <r>       PUT ratio for mixed (0..1)\n"
+                << "  --delete-ratio <r>    DELETE ratio for mixed (0..1)\n"
+                << "  --seed <n>            RNG seed\n"
+                << "  --csv <file>          Write summary CSV row\n";
+            std::exit(0);
+        }
+    }
+
+    return cfg;
+}
+
+int run_loadgen(const LoadGenConfig& cfg) {
+    log_info("Loadgen connecting to " + cfg.host + ":" + std::to_string(cfg.port) +
+             " workload=" + cfg.workload +
+             " clients=" + std::to_string(cfg.clients));
+
+    std::atomic<uint64_t> ok{0};
+    std::atomic<uint64_t> fail{0};
+    std::mutex lat_mu;
+    std::vector<double> lat_ms;
+
+    auto start_all = std::chrono::steady_clock::now();
+    auto warmup_end = start_all + std::chrono::seconds(cfg.warmup_s);
+    auto measure_end = warmup_end + std::chrono::seconds(cfg.measure_s);
+
+    // Samples for CPU and disk over the measurement window (warmup excluded)
+    CpuSample cpu_before{}, cpu_after{};
+    DiskSample disk_before{}, disk_after{};
+    bool have_cpu_samples  = false;
+    bool have_disk_samples = false;
+
+    auto worker = [&](int id) {
+        httplib::Client cli(cfg.host, cfg.port);
+        cli.set_keep_alive(true);
+
+        std::mt19937_64 rng(cfg.seed + static_cast<std::uint64_t>(id));
+        if (cfg.keys == 0) {
+            // Avoid UB if someone misconfigures keys=0
+            return;
+        }
+        std::uniform_int_distribution<std::uint64_t> keydist(0, cfg.keys - 1);
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+
+        // For get-popular: define a hot subset
+        const double hot_prob = 0.9; // 90% of requests go to hot set
+        std::size_t hot_count = std::min<std::size_t>(5, cfg.keys); // up to 5 hot keys
+        std::uniform_int_distribution<std::uint64_t> hotdist(
+            0, hot_count > 0 ? static_cast<std::uint64_t>(hot_count - 1) : 0
+        );
+        // Cold range: [hot_count, cfg.keys-1] if there is any cold key
+        std::uniform_int_distribution<std::uint64_t> colddist(
+            hot_count, cfg.keys > hot_count ? static_cast<std::uint64_t>(cfg.keys - 1)
+                                            : static_cast<std::uint64_t>(hot_count)
+        );
+
+        while (std::chrono::steady_clock::now() < measure_end) {
+            Op op = Op::GET;
+
+            if (cfg.workload == "get-popular") {
+                op = Op::GET;
+            } else if (cfg.workload == "get-all") {
+                op = Op::GET;
+            } else if (cfg.workload == "put-all") {
+                op = Op::PUT;
+            } else if (cfg.workload == "mixed") {
+                double r = u01(rng);
+                if (r < cfg.put_ratio) op = Op::PUT;
+                else if (r < cfg.put_ratio + cfg.delete_ratio) op = Op::DEL;
+                else op = Op::GET;
+            }
+
+            // --- Key selection logic ---
+            uint64_t key_index = 0;
+
+            if (cfg.workload == "get-popular") {
+                // 90% of requests go to the first 'hot_count' keys,
+                // remaining 10% spread across the rest of the keyspace.
+                if (cfg.keys <= hot_count) {
+                    // All keys are "hot" if total keys <= hot_count
+                    key_index = hotdist(rng);
+                } else {
+                    double r = u01(rng);
+                    if (r < hot_prob) {
+                        key_index = hotdist(rng);     // pick from hot subset
+                    } else {
+                        key_index = colddist(rng);    // pick from cold keys
+                    }
+                }
+            } else {
+                // Other workloads: uniform over full key range
+                key_index = keydist(rng);
+            }
+
+            std::string key = "key" + std::to_string(key_index);
+
+            auto t0 = std::chrono::steady_clock::now();
+
+            bool success = false;
+
+            if (op == Op::GET) {
+                auto res = cli.Get(("/get/" + url_encode(key)).c_str());
+                success = (res && res->status == 200);
+            } else if (op == Op::PUT) {
+                httplib::Params p;
+                p.emplace("value", "v" + std::to_string(id));
+                auto res = cli.Put(("/put/" + url_encode(key)).c_str(), p);
+                success = (res && res->status == 200);
+            } else { // DEL
+                auto res = cli.Delete(("/delete/" + url_encode(key)).c_str());
+                success = (res && (res->status == 200 || res->status == 404));
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            auto now = std::chrono::steady_clock::now();
+            if (now > warmup_end && now <= measure_end) {
+                if (success) ok.fetch_add(1, std::memory_order_relaxed);
+                else         fail.fetch_add(1, std::memory_order_relaxed);
+
+                std::lock_guard<std::mutex> lk(lat_mu);
+                lat_ms.push_back(ms);
+            }
         }
     };
 
-    // Launch threads
+    // Background sampler: measure CPU and disk during the *measurement* window only
+    std::thread sampler([&]() {
+        // Wait until warmup is done
+        std::this_thread::sleep_until(warmup_end);
+
+        have_cpu_samples  = read_cpu_sample(cpu_before);
+        have_disk_samples = read_disk_sample(disk_before);
+
+        // Wait until measurement is done
+        std::this_thread::sleep_until(measure_end);
+
+        if (have_cpu_samples) {
+            have_cpu_samples = read_cpu_sample(cpu_after);
+        }
+        if (have_disk_samples) {
+            have_disk_samples = read_disk_sample(disk_after);
+        }
+    });
+
     std::vector<std::thread> threads;
-    threads.reserve(std::max(1, S.clients));
-    for (int i = 0; i < std::max(1, S.clients); ++i) {
+    threads.reserve(cfg.clients);
+    for (int i = 0; i < cfg.clients; ++i) {
         threads.emplace_back(worker, i);
     }
-    for (auto& th : threads) th.join();
+    for (auto& t : threads) t.join();
 
-    const auto elapsed_s = std::chrono::duration<double>(clock::now() - t_start).count();
-    Result R{};
-    R.requests_ok = total_ok.load();
-    R.requests_fail = total_fail.load();
+    auto end_all = std::chrono::steady_clock::now();
+    (void)end_all; // currently unused
 
-    if (!all_lat_ms.empty()) {
-        // Sort for percentiles
-        std::sort(all_lat_ms.begin(), all_lat_ms.end());
-        // Average
-        double sum = std::accumulate(all_lat_ms.begin(), all_lat_ms.end(), 0.0);
-        R.avg_latency_ms = sum / static_cast<double>(all_lat_ms.size());
-        R.p50_ms = percentile_ms(all_lat_ms, 50.0);
-        R.p95_ms = percentile_ms(all_lat_ms, 95.0);
-        R.p99_ms = percentile_ms(all_lat_ms, 99.0);
-    } else {
-        R.avg_latency_ms = R.p50_ms = R.p95_ms = R.p99_ms = 0.0;
+    if (sampler.joinable()) {
+        sampler.join();
     }
 
-    const double total_requests = static_cast<double>(R.requests_ok + R.requests_fail);
-    R.throughput_rps = elapsed_s > 0.0 ? (total_requests / elapsed_s) : 0.0;
+    double measure_seconds = static_cast<double>(cfg.measure_s);
+    double thr = measure_seconds > 0.0 ? static_cast<double>(ok.load()) / measure_seconds : 0.0;
 
-    return R;
+    double avg = 0.0;
+    if (!lat_ms.empty()) {
+        double sum = 0.0;
+        for (double x : lat_ms) sum += x;
+        avg = sum / static_cast<double>(lat_ms.size());
+    }
+    double p50 = pctl(lat_ms, 50.0);
+    double p95 = pctl(lat_ms, 95.0);
+    double p99 = pctl(lat_ms, 99.0);
+
+    double cpu_util = 0.0;
+    double disk_read_MBps = 0.0;
+    double disk_write_MBps = 0.0;
+
+    if (have_cpu_samples) {
+        cpu_util = cpu_utilization(cpu_before, cpu_after);
+    }
+    if (have_disk_samples) {
+        compute_disk_rates(disk_before, disk_after, measure_seconds,
+                           disk_read_MBps, disk_write_MBps);
+    }
+
+    std::cout << "Loadgen summary:\n"
+              << "  ok=" << ok.load() << " fail=" << fail.load() << "\n"
+              << "  throughput=" << thr << " req/s\n"
+              << "  avg=" << avg << "ms p50=" << p50
+              << "ms p95=" << p95 << "ms p99=" << p99 << "ms\n"
+              << "  cpu_util=" << cpu_util << "%\n"
+              << "  disk_read=" << disk_read_MBps << " MB/s"
+              << " disk_write=" << disk_write_MBps << " MB/s\n";
+
+    if (!cfg.csv_file.empty()) {
+        bool exists = false;
+        {
+            std::ifstream in(cfg.csv_file);
+            exists = in.good();
+        }
+        std::ofstream out(cfg.csv_file, std::ios::app);
+        if (!out) {
+            std::cerr << "Failed to open CSV file: " << cfg.csv_file << "\n";
+        } else {
+            if (!exists) {
+                out << "timestamp,host,port,workload,clients,warmup_s,measure_s,keys,"
+                       "put_ratio,delete_ratio,seed,ok,fail,thr_rps,avg_ms,p50_ms,p95_ms,p99_ms,"
+                       "cpu_utilization,disk_read_MBps,disk_write_MBps\n";
+            }
+            auto ts = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            out << ts << ","
+                << cfg.host << ","
+                << cfg.port << ","
+                << cfg.workload << ","
+                << cfg.clients << ","
+                << cfg.warmup_s << ","
+                << cfg.measure_s << ","
+                << cfg.keys << ","
+                << cfg.put_ratio << ","
+                << cfg.delete_ratio << ","
+                << cfg.seed << ","
+                << ok.load() << ","
+                << fail.load() << ","
+                << thr << ","
+                << avg << ","
+                << p50 << ","
+                << p95 << ","
+                << p99 << ","
+                << cpu_util << ","
+                << disk_read_MBps << ","
+                << disk_write_MBps << "\n";
+        }
+    }
+
+    return 0;
 }

@@ -1,0 +1,2 @@
+timestamp,host,port,workload,clients,warmup_s,measure_s,keys,put_ratio,delete_ratio,seed,ok,fail,thr_rps,avg_ms,p50_ms,p95_ms,p99_ms,cpu_utilization,disk_read_MBps,disk_write_MBps
+1764063610,127.0.0.1,8080,get-popular,128,60,300,5000000,0.1,0,12345,87464,9051,291.547,397.905,41.0296,1867.17,1876.39,10.3825,0,0.163568

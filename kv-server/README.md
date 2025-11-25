@@ -1,363 +1,892 @@
-# KV Server (C++): HTTP Key–Value store with Cache, DB & Load Generator
+Here’s an updated `README.md` with:
 
-A multi-threaded HTTP key–value store with:
+* CSV columns fixed (`disk_read_MBps`, `disk_write_MBps`), and
+* A new **section 10.4** explaining `mpstat`, `iostat`, and `pidstat` usage in detail.
 
-* **REST API** for CRUD
-* **In-memory LRU cache** for hot data
-* **SQLite** persistent storage (WAL, prepared statements)
-* **Client CLI** and **closed-loop load generator**
-* **Tests** for cache, DB, and server routes
+You can paste this into `~/Desktop/DECS/kv-server/README.md`.
 
-This README is the up-to-date “how to build, run, test, and load-test” guide.
+````markdown
+# CS744 DECS KV-Server
+
+A simple distributed key–value store for the CS744 DECS project with:
+
+- HTTP server (`kv-server`) exposing GET/PUT/DELETE REST endpoints
+- In-memory LRU cache
+- Persistent PostgreSQL database backend
+- Closed-loop load generator (`kv-loadgen`) for experimental workloads
+- Python scripts for throughput/latency analysis and plotting
+
+The repo is assumed to live at:
+
+```bash
+~/Desktop/DECS/kv-server
+````
+
+Adjust paths if yours is different.
 
 ---
 
-## 1) Requirements
+## 1. System Architecture
 
-Ubuntu/Debian (others similar):
+### 1.1 High-level view
 
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake pkg-config libsqlite3-dev curl
-# For utilization tools (recommended for bottleneck proof)
-sudo apt-get install -y sysstat
-# For plotting (optional)
-sudo apt-get install -y python3-matplotlib
+The system is a classic **three-tier** setup:
+
+1. **Client / Load generator**
+
+   * Either a human (using `curl` or `kv-client`), or the `kv-loadgen` binary.
+   * Sends HTTP requests to the server.
+
+2. **HTTP KV server**
+
+   * Binary: `kv-server`
+   * Uses `cpp-httplib` to expose REST endpoints:
+
+     * `GET  /health`
+     * `GET  /metrics`
+     * `PUT  /put/<key>?value=<value>`
+     * `GET  /get/<key>`
+     * `DELETE /delete/<key>`
+   * Orchestrates:
+
+     * Lookups in the in-memory **LRU cache**
+     * Reads/writes/deletes from/to PostgreSQL
+
+3. **Database (PostgreSQL)**
+
+   * Stores key–value pairs persistently in a `kv` table.
+   * The server uses a small connection pool for concurrency.
+
+### 1.2 Request path
+
+* **PUT**
+
+  1. Client calls `PUT /put/<key>?value=<value>`.
+  2. Server writes the pair to the DB (`db_put`).
+  3. Server updates the in-memory cache (`cache.put(key, value)`).
+  4. Returns `200 OK`.
+
+* **GET**
+
+  1. Client calls `GET /get/<key>`.
+  2. Server checks the cache:
+
+     * On hit: returns cached value (`200 OK`).
+     * On miss: queries DB (`db_get`).
+
+       * If found: inserts into cache and returns `200 OK`.
+       * If not found: returns `404 Not Found`.
+  3. Cache hit/miss statistics are tracked.
+
+* **DELETE**
+
+  1. Client calls `DELETE /delete/<key>`.
+  2. Server removes key in DB (`db_delete`) and cache (`cache.erase`).
+  3. Returns `200 OK` if key existed, `404 Not Found` otherwise.
+
+### 1.3 Metrics & logging
+
+* `/metrics` returns JSON metrics:
+
+  * `requests_total`, `errors_total`
+  * `cache_hits`, `cache_misses`
+  * `cache_capacity`
+* Logging is handled by utilities in `utils.*`, with a global log level and optional process CPU affinity.
+
+---
+
+## 2. Repository Layout
+
+At a high level:
+
+```text
+kv-server/
+├── CMakeLists.txt
+├── include/
+│   ├── cache.h          # LRUCache class
+│   ├── config.h         # Config struct and parsing
+│   ├── database.h       # DB API: db_init, db_put, db_get, db_delete
+│   ├── server.h         # run_server(...)
+│   ├── utils.h          # logging, affinity helpers, URL encode/decode, etc.
+│   └── ...
+├── src/
+│   ├── cache.cpp        # LRU cache implementation
+│   ├── config.cpp       # parses CLI args / config file into Config
+│   ├── database.cpp     # PostgreSQL connection pool and KV operations
+│   ├── server.cpp       # HTTP server, handlers for /put, /get, /delete, /metrics, /health
+│   ├── utils.cpp        # logging, affinity, small helpers
+│   └── main.cpp         # main() entry for kv-server
+├── loadgen/
+│   └── load_generator.cpp  # main() for kv-loadgen; workload logic
+├── tests/
+│   ├── test_cache.cpp      # unit tests for LRUCache
+│   ├── test_database.cpp   # DB tests (put/get/delete)
+│   └── test_server.cpp     # HTTP API tests
+├── csv/                 # (created by you) CSV outputs from kv-loadgen
+├── plots/               # (created by you) Generated PNG plots
+├── run_all_workloads.sh # helper script to run all experiments
+└── plot_results.py      # Python script to generate plots
 ```
 
 ---
 
-## 2) Build
+## 3. Prerequisites
 
-Release build (recommended for load tests):
+### 3.1 System packages (Ubuntu/Debian)
+
+```bash
+sudo apt update
+sudo apt install -y \
+  g++ cmake make \
+  libpq-dev postgresql postgresql-contrib \
+  python3 python3-pip \
+  sysstat
+```
+
+(`sysstat` provides `mpstat` and `iostat`.)
+
+### 3.2 Python packages
+
+```bash
+pip3 install pandas matplotlib
+```
+
+---
+
+## 4. PostgreSQL Setup
+
+Start PostgreSQL:
+
+```bash
+sudo service postgresql start
+```
+
+Create user, database, and grant privileges (match these with your `Config` defaults):
+
+```bash
+sudo -u postgres psql <<EOF
+CREATE USER kvuser WITH PASSWORD 'skeys';
+CREATE DATABASE kvdb OWNER kvuser;
+GRANT ALL PRIVILEGES ON DATABASE kvdb TO kvuser;
+EOF
+```
+
+Create the `kv` table:
+
+```bash
+psql -h 127.0.0.1 -U kvuser -d kvdb <<EOF
+CREATE TABLE IF NOT EXISTS kv (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+EOF
+```
+
+(Use `-W` if prompted for a password; the default here is `skeys`.)
+
+---
+
+## 5. Building the Project
+
+From the repo root:
 
 ```bash
 cd ~/Desktop/DECS/kv-server
+
 rm -rf build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ```
 
-### What gets built
+Binaries (in `build/`):
 
-* `build/kv-server` – server
-* `build/kv-client` – simple client
-* `build/kv-loadgen` – load generator
-* Tests (when `BUILD_TESTS=ON`): `test-cache`, `test-database`, `test-server`
+* `kv-server`      – HTTP KV server
+* `kv-client`      – simple CLI client
+* `kv-loadgen`     – load generator
+* `test-cache`     – cache unit tests
+* `test-database`  – DB unit tests
+* `test-server`    – server/API tests
 
-> We use header-only deps via CMake `FetchContent`: **cpp-httplib** and **nlohmann/json**.
-> DB backend macro `DB_BACKEND_SQLITE` is enabled by default.
-
----
-
-## 3) Configuration
-
-Edit `config/server_config.json` (or set `KV_SERVER_CONFIG` env var):
-
-```json
-{
-  "server_port": 8080,
-  "cache_size": 20000,
-  "database_path": "kv_store.db",
-  "log_level": "ERROR",
-  "thread_pool_size": 16
-}
-```
-
-* `cache_size` controls hot-set fit (bigger → more hits/CPU-bound).
-* `log_level`: `TRACE|DEBUG|INFO|WARN|ERROR|OFF`.
-
----
-
-## 4) Run the server
+### 5.1 Optional unit tests
 
 ```bash
-./build/kv-server
-# (or override config quickly)
-./build/kv-server --port 8080 --cache-size 20000 --threads 16 --db kv_store.db
+cd build
+./test-cache
+./test-database
+./test-server
 ```
 
-Health check:
+---
+
+## 6. Single-client Usage
+
+### 6.1 Start the server
+
+In one terminal:
 
 ```bash
-curl http://localhost:8080/health
+cd ~/Desktop/DECS/kv-server/build
+./kv-server --port 8080
 ```
 
----
+### 6.2 Health check (curl)
 
-## 5) REST API
-
-* `GET /health` → `200 OK`
-* `GET /get/{key}` → `200 value` or `404`
-* `POST /put/{key}/{value}` → `200` (upsert; updates DB then cache)
-* `DELETE /delete/{key}` → `200` if deleted, `404` if missing
-
-Examples:
+In another terminal:
 
 ```bash
-curl -X POST "http://localhost:8080/put/user123/hello"
-curl "http://localhost:8080/get/user123"
-curl -X DELETE "http://localhost:8080/delete/user123"
+curl -v http://127.0.0.1:8080/health
+# Expect: HTTP/1.1 200 OK, body: OK
 ```
 
----
+### 6.3 Single-client PUT/GET/DELETE with curl
 
-## 6) Client CLI
-
-From **repo root**:
+**PUT a value:**
 
 ```bash
-./build/kv-client health
-./build/kv-client put user123 hello
-./build/kv-client get user123
-./build/kv-client delete user123
+curl -v -X PUT "http://127.0.0.1:8080/put/foo?value=bar"
 ```
 
----
-
-## 7) Load Generator
-
-Closed-loop threads; supports multiple workloads.
-
-```
-./build/kv-loadgen --host localhost --port 8080 \
-  --clients 128 --duration 120s \
-  --workload get-popular --keys 500
-```
-
-**Workloads**
-
-* `put-all` – writes only (DB write-heavy, I/O-bound)
-* `get-all` – reads unique keys (forced cache misses, I/O-bound)
-* `get-popular` – small hot set (cache hits, CPU/memory-bound)
-* `mixed` – tunable: `--put-ratio`, `--delete-ratio`, rest are GETs
-
-Common args:
-
-* `--clients N` concurrent threads
-* `--duration 30s|300s|…`
-* `--timeout-ms 3000`
-* `--keys N` (size of hot set for `get-popular`/`mixed`)
-* `--put-ratio`, `--delete-ratio` (for `mixed`)
-
-Reports (stdout):
-
-* `requests_ok`, `requests_fail`
-* `throughput (req/s)`
-* `avg latency (ms)`, `p50/p95/p99`
-
----
-
-## 8) How it works (data flow)
-
-* **PUT**: DB upsert (prepared statement) → update cache (LRU) → `200`.
-* **GET**: check cache → hit → `200`; miss → DB select → (if found) cache insert → `200` else `404`.
-* **DELETE**: DB delete authoritative → erase from cache if present → `200` or `404`.
-
-Thread safety:
-
-* Cache protected by a mutex (O(1) ops).
-* SQLite single connection + mutex, WAL mode, `busy_timeout=5s`.
-
----
-
-## 9) Proving CPU-bound vs I/O-bound (what to run & what to observe)
-
-Open 3 terminals to **monitor** while you run loads:
-
-**Find server PID**
+**GET the same key:**
 
 ```bash
-SERVER_PID=$(pgrep -n kv-server); echo "$SERVER_PID"
+curl -v "http://127.0.0.1:8080/get/foo"
+# -> HTTP/1.1 200 OK, body: bar
 ```
 
-**CPU per core (Terminal A)**
+**DELETE the key:**
+
+```bash
+curl -v -X DELETE "http://127.0.0.1:8080/delete/foo"
+```
+
+**Confirm it’s gone:**
+
+```bash
+curl -v "http://127.0.0.1:8080/get/foo"
+# -> HTTP/1.1 404 Not Found, body: Not found
+```
+
+### 6.4 Single-client PUT/GET/DELETE with kv-client
+
+From the `build/` directory:
+
+```bash
+cd ~/Desktop/DECS/kv-server/build
+```
+
+**PUT a value:**
+
+```bash
+./kv-client --host 127.0.0.1 --port 8080 put foo bar
+```
+
+**GET the same key:**
+
+```bash
+./kv-client --host 127.0.0.1 --port 8080 get foo
+# expected output: bar
+```
+
+**DELETE the key:**
+
+```bash
+./kv-client --host 127.0.0.1 --port 8080 delete foo
+```
+
+**Confirm it’s gone:**
+
+```bash
+./kv-client --host 127.0.0.1 --port 8080 get foo
+# expected output: a "not found" message or empty result
+```
+
+> If your `kv-client` uses different flags or syntax, run `./kv-client --help` and adjust the commands accordingly.
+
+---
+
+## 7. CPU Pinning Layout for Experiments
+
+To reduce noise and clearly separate bottlenecks, we pin processes to specific CPU cores:
+
+* **Server + PostgreSQL** on cores **0,1**
+* **Load generator** on cores **2,3**
+
+### 7.1 Pin the server (cores 0–1)
+
+```bash
+cd ~/Desktop/DECS/kv-server/build
+taskset -c 0-1 ./kv-server --port 8080
+```
+
+Leave this running.
+
+### 7.2 Pin PostgreSQL (cores 0–1)
+
+In another terminal:
+
+```bash
+for pid in $(pgrep -u postgres postgres); do
+  echo "Pinning postgres PID $pid to cores 0-1"
+  sudo taskset -cp 0-1 "$pid"
+done
+```
+
+Now both the HTTP server and DB processes are constrained to cores 0 and 1.
+
+---
+
+## 8. Load Testing with kv-loadgen
+
+We use `kv-loadgen` to generate controlled workloads and collect statistics into CSV files.
+
+Workloads:
+
+* `put-all`     – populates or updates the keyspace with PUTs
+* `get-popular` – cache-heavy workload, repeatedly hitting a small subset of keys
+* `get-all`     – DB-heavy workload, scanning a larger keyspace
+
+### 8.1 CSV directory
+
+From repo root:
+
+```bash
+cd ~/Desktop/DECS/kv-server
+mkdir -p csv
+```
+
+### 8.2 Script: run_all_workloads.sh
+
+Create `~/Desktop/DECS/kv-server/run_all_workloads.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Paths
+ROOT="$HOME/Desktop/DECS/kv-server"
+BUILD="$ROOT/build"
+CSV_DIR="$ROOT/csv"
+
+mkdir -p "$CSV_DIR"
+cd "$BUILD"
+
+# Common settings
+HOST=127.0.0.1
+PORT=8080
+KEYS=500
+
+# Timings
+WARMUP_PUT=0
+MEASURE_PUT=60
+
+WARMUP_GET=60
+MEASURE_GET=300
+
+# Client counts to sweep
+CLIENTS=(8 16 32 64 128)
+
+for c in "${CLIENTS[@]}"; do
+  echo "============================"
+  echo "Clients: $c"
+  echo "============================"
+
+  echo "[PUT-ALL] clients=$c"
+  taskset -c 2-3 ./kv-loadgen \
+    --host "$HOST" \
+    --port "$PORT" \
+    --workload put-all \
+    --clients "$c" \
+    --keys "$KEYS" \
+    --warmup "$WARMUP_PUT" \
+    --measure "$MEASURE_PUT" \
+    --csv "$CSV_DIR/putall_c${c}.csv"
+
+  echo "[GET-POPULAR] clients=$c"
+  taskset -c 2-3 ./kv-loadgen \
+    --host "$HOST" \
+    --port "$PORT" \
+    --workload get-popular \
+    --clients "$c" \
+    --keys "$KEYS" \
+    --warmup "$WARMUP_GET" \
+    --measure "$MEASURE_GET" \
+    --csv "$CSV_DIR/cpu_getpopular_c${c}.csv"
+
+  echo "[GET-ALL] clients=$c"
+  taskset -c 2-3 ./kv-loadgen \
+    --host "$HOST" \
+    --port "$PORT" \
+    --workload get-all \
+    --clients "$c" \
+    --keys "$KEYS" \
+    --warmup "$WARMUP_GET" \
+    --measure "$MEASURE_GET" \
+    --csv "$CSV_DIR/io_getall_c${c}.csv"
+
+  echo
+done
+
+echo "All runs completed. CSVs are in: $CSV_DIR"
+```
+
+Make it executable:
+
+```bash
+cd ~/Desktop/DECS/kv-server
+chmod +x run_all_workloads.sh
+```
+
+### 8.3 Run the full experiment
+
+1. **Start server pinned to cores 0,1**
+
+   ```bash
+   cd ~/Desktop/DECS/kv-server/build
+   taskset -c 0-1 ./kv-server --port 8080
+   ```
+
+2. **Pin PostgreSQL to cores 0,1** (if needed):
+
+   ```bash
+   for pid in $(pgrep -u postgres postgres); do
+     sudo taskset -cp 0-1 "$pid"
+   done
+   ```
+
+3. **Run pinned loadgen for all workloads (cores 2,3)**:
+
+   ```bash
+   cd ~/Desktop/DECS/kv-server
+   ./run_all_workloads.sh
+   ```
+
+You should get CSV files like:
+
+* `csv/putall_c8.csv`, `putall_c16.csv`, …, `putall_c128.csv`
+* `csv/cpu_getpopular_c8.csv`, …, `cpu_getpopular_c128.csv`
+* `csv/io_getall_c8.csv`, …, `io_getall_c128.csv`
+
+Each CSV contains columns such as:
+
+```text
+timestamp,host,port,workload,clients,warmup_s,measure_s,keys,
+put_ratio,delete_ratio,seed,ok,fail,thr_rps,avg_ms,p50_ms,p95_ms,p99_ms,
+cpu_utilization,disk_read_MBps,disk_write_MBps
+```
+
+---
+
+## 9. Plotting Throughput and Latency
+
+We use a Python script to generate simple, separate plots for each workload:
+
+* Throughput vs number of clients
+* Latency (avg and p95) vs number of clients
+
+### 9.1 plot_results.py
+
+Create `~/Desktop/DECS/kv-server/plot_results.py`:
+
+```python
+#!/usr/bin/env python3
+import argparse
+import glob
+import os
+from typing import List
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def load_all_csv(csv_dir: str) -> pd.DataFrame:
+    pattern = os.path.join(csv_dir, "*.csv")
+    files: List[str] = glob.glob(pattern)
+    if not files:
+        raise SystemExit(f"No CSV files found in {csv_dir!r}")
+
+    frames = []
+    for path in files:
+        try:
+            df = pd.read_csv(path)
+            df["source_file"] = os.path.basename(path)
+            frames.append(df)
+        except Exception as e:
+            print(f"Warning: failed to read {path}: {e}")
+
+    if not frames:
+        raise SystemExit("No CSV files could be read successfully.")
+
+    all_data = pd.concat(frames, ignore_index=True)
+
+    # Drop runs with ok == 0 (failed experiments)
+    if "ok" in all_data.columns:
+        before = len(all_data)
+        all_data = all_data[all_data["ok"] > 0].copy()
+        after = len(all_data)
+        if after < before:
+            print(f"Filtered out {before - after} rows with ok == 0")
+
+    return all_data
+
+
+def plot_workload(df: pd.DataFrame, workload_name: str, output_dir: str) -> None:
+    sub = df[df["workload"] == workload_name].copy()
+    if sub.empty:
+        print(f"No data for workload={workload_name!r}, skipping plots.")
+        return
+
+    if "clients" not in sub.columns or "thr_rps" not in sub.columns:
+        raise SystemExit("CSV must have 'clients' and 'thr_rps' columns.")
+
+    # Aggregate in case of multiple runs per client count
+    agg = sub.groupby("clients", as_index=False).agg(
+        thr_rps=("thr_rps", "mean"),
+        avg_ms=("avg_ms", "mean"),
+        p95_ms=("p95_ms", "mean"),
+    )
+
+    agg = agg.sort_values("clients")
+
+    # Print table for quick inspection
+    print(f"\n=== {workload_name} ===")
+    print(agg[["clients", "thr_rps", "avg_ms", "p95_ms"]])
+
+    safe_name = workload_name.replace(" ", "_")
+
+    # Throughput vs clients
+    plt.figure()
+    plt.plot(agg["clients"], agg["thr_rps"], marker="o")
+    plt.xlabel("Number of clients")
+    plt.ylabel("Throughput (requests/second)")
+    plt.title(f"Throughput vs Clients – {workload_name}")
+    plt.grid(True)
+    plt.tight_layout()
+    out_thr = os.path.join(output_dir, f"{safe_name}_throughput.png")
+    plt.savefig(out_thr)
+    plt.close()
+    print(f"Saved {out_thr}")
+
+    # Latency vs clients (avg + p95)
+    plt.figure()
+    plt.plot(agg["clients"], agg["avg_ms"], marker="o", label="Average latency")
+    plt.plot(agg["clients"], agg["p95_ms"], marker="s", label="p95 latency")
+    plt.xlabel("Number of clients")
+    plt.ylabel("Latency (ms)")
+    plt.title(f"Latency vs Clients – {workload_name}")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    out_lat = os.path.join(output_dir, f"{safe_name}_latency.png")
+    plt.savefig(out_lat)
+    plt.close()
+    print(f"Saved {out_lat}")
+```
+
+```python
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Plot throughput and latency vs clients for DECS KV-server workloads."
+    )
+    parser.add_argument(
+        "--csv-dir",
+        default="csv",
+        help="Directory containing CSV result files (default: ./csv)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default="plots",
+        help="Directory to store generated PNG plots (default: ./plots)",
+    )
+    args = parser.parse_args()
+
+    csv_dir = os.path.abspath(args.csv_dir)
+    out_dir = os.path.abspath(args.out_dir)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    data = load_all_csv(csv_dir)
+
+    workloads = ["put-all", "get-popular", "get-all"]
+    for w in workloads:
+        plot_workload(data, w, out_dir)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Make it executable (optional):
+
+```bash
+cd ~/Desktop/DECS/kv-server
+chmod +x plot_results.py
+```
+
+### 9.2 Generate plots
+
+From the repo root:
+
+```bash
+cd ~/Desktop/DECS/kv-server
+mkdir -p plots
+python3 plot_results.py --csv-dir csv --out-dir plots
+```
+
+This creates:
+
+* `plots/put-all_throughput.png`
+* `plots/put-all_latency.png`
+* `plots/get-popular_throughput.png`
+* `plots/get-popular_latency.png`
+* `plots/get-all_throughput.png`
+* `plots/get-all_latency.png`
+
+---
+
+## 10. CPU-bound and IO-bound Testing
+
+This section explains **how to show that different workloads stress different resources**.
+
+### 10.1 CPU-bound testing (get-popular)
+
+Goal: show the **server CPU** is the bottleneck while disk IO is low.
+
+1. **Workload:** `get-popular`
+
+   * Repeatedly accesses a *small set of hot keys* (e.g., 5 hot keys within `--keys 500`).
+   * After warmup, most reads hit the in-memory cache.
+
+2. **Cache configuration:**
+
+   * Set `cache_size` in your `Config` ≥ number of hot keys (e.g., ≥ 500).
+   * This ensures hot keys stay in memory.
+
+3. **Run with pinned cores:**
+
+   * Server + DB on cores `0,1`.
+   * Loadgen on cores `2,3` via `run_all_workloads.sh`.
+   * Focus on CSVs: `csv/cpu_getpopular_c*.csv`.
+
+4. **Observations:**
+
+   * Throughput increases with more clients until server CPU saturates.
+   * Latency grows once server CPU hits high utilization on core 0 (which `kv-loadgen` samples).
+   * Disk IO (from `iostat`) remains relatively low.
+
+5. **Optional live monitoring:** see Section **10.4** (`mpstat`, `iostat`, `pidstat`).
+
+**Conclusion:**
+`get-popular` is **CPU-bound** because the cache eliminates most disk IO, and the server CPU becomes the limiting resource.
+
+### 10.2 IO-bound testing (get-all)
+
+Goal: show the **database / disk IO** is the bottleneck while server CPU is not fully used.
+
+1. **Workload:** `get-all`
+
+   * Scans a much larger keyspace and/or more uniformly distributed keys.
+   * Many requests miss the cache and go to the DB.
+
+2. **Cache configuration:**
+
+   * `cache_size` smaller than total keys or just rely on uniform key distribution.
+   * Large fraction of requests will hit the DB.
+
+3. **Run with pinned cores:**
+
+   * Server + DB on cores `0,1`.
+   * Loadgen on cores `2,3`.
+   * Focus on CSVs: `csv/io_getall_c*.csv`.
+
+4. **Observations:**
+
+   * Throughput increases initially with more clients, but flattens early when DB/disk saturate.
+   * Latency rises sharply as concurrency grows (queueing at the DB).
+   * Disk IO and DB CPU (via `iostat` / `pidstat`) are high; server CPU may be moderate.
+
+5. **Optional live monitoring:** see Section **10.4** (`mpstat`, `iostat`, `pidstat`).
+
+**Conclusion:**
+`get-all` is **IO-bound** because performance is limited by disk/DB throughput rather than server CPU.
+
+### 10.3 Putting it together
+
+Using plots from `plot_results.py`:
+
+* **CPU-bound (get-popular):**
+
+  * Throughput vs clients shows CPU saturation on server cores.
+  * Latency vs clients stays low until CPU is maxed, then grows.
+  * Disk IO is low.
+
+* **IO-bound (get-all):**
+
+  * Throughput vs clients flattens earlier.
+  * Latency vs clients grows sharply as concurrency increases.
+  * Disk IO and DB CPU are high, while server CPU may not be fully utilized.
+
+This gives a clear story for the final writeup: two workloads, two different bottlenecks, same multi-tier system.
+
+### 10.4 Using mpstat, iostat, and pidstat
+
+To **cross-check** and **visualize** resource usage while `kv-loadgen` runs, you can use three standard tools:
+
+#### 10.4.1 mpstat – per-CPU utilization
+
+`mpstat` shows CPU usage per core.
+
+Install (already covered via `sysstat`):
+
+```bash
+sudo apt install sysstat
+```
+
+Run:
 
 ```bash
 mpstat -P ALL 1
 ```
 
-**Disk I/O (Terminal B)**
+* `-P ALL` = show all CPUs (core 0, 1, 2, 3, …).
+* `1` = refresh every 1 second.
+
+Look at:
+
+* `CPU 0` and `CPU 1`: server + PostgreSQL (we pinned them there).
+* `CPU 2` and `CPU 3`: load generator.
+
+Important columns:
+
+* `%usr` – user space usage
+* `%sys` – kernel usage
+* `%idle` – idle time
+
+For **CPU-bound get-popular**:
+
+* Expect `CPU 0` (and maybe `CPU 1`) to have high `%usr + %sys`, low `%idle`.
+
+For **IO-bound get-all**:
+
+* CPU might have more idle time; bottleneck will show up more in `iostat`.
+
+#### 10.4.2 iostat – disk utilization
+
+`iostat` shows per-disk read/write rates and utilization.
+
+Run:
 
 ```bash
 iostat -dx 1
 ```
 
-**Server process stats (Terminal C)**
+* `-d` = disk-only statistics.
+* `-x` = extended details (including `%util`).
+* `1` = refresh every 1 second.
+
+Key columns:
+
+* `r/s` – read requests per second
+* `w/s` – write requests per second
+* `rkB/s` – read throughput (kB/s)
+* `wkB/s` – write throughput (kB/s)
+* `%util` – fraction of time the disk is busy
+
+For **IO-bound get-all** and **put-all**:
+
+* Expect high `%util` approaching 100% and high `rkB/s` / `wkB/s`.
+* This confirms that the disk/DB is the limiting factor.
+
+#### 10.4.3 pidstat – per-process usage (CPU and IO)
+
+`pidstat` shows CPU and I/O usage per process (and per thread if requested).
+
+**CPU usage per process:**
 
 ```bash
-pidstat -r -u -d -h -p "$SERVER_PID" 1
+pidstat -u 1 -p $(pgrep kv-server)
 ```
 
-### CPU-bound proof (cache-hit heavy)
+* `-u` = show CPU usage.
+* `1` = refresh every 1 second.
+* `-p <PID>` = restrict to `kv-server` process.
 
-Start server with a **large cache** (already done in config), then:
+Watch the `%CPU` column:
+
+* Close to 100% (on one core) indicates a CPU-bound scenario for that process.
+
+**Disk I/O per process:**
 
 ```bash
-./build/kv-loadgen --clients 128 --duration 120s --workload get-popular --keys 500
+pidstat -d 1 -p $(pgrep -u postgres postgres | head -n 1)
 ```
 
-Expect:
+* `-d` = I/O statistics.
+* `-p` = pick one PostgreSQL backend PID.
 
-* `mpstat`: `%usr+%sys` high (busy cores), `%iowait` low
-* `iostat`: disk `%util` low, `await` low
-* `pidstat`: high `%CPU`, tiny `kB_rd/s` & `kB_wr/s`
-* Loadgen: high throughput, low latency
+Check:
 
-### I/O-bound proof (DB-heavy)
+* `kB_rd/s`, `kB_wr/s` – per-process disk read/write throughput.
+* This helps show that PostgreSQL is doing a lot of IO in the IO-bound workloads.
 
-Option A (writes):
+You can mention these tools and screenshots in your report to support statements like:
 
-```bash
-./build/kv-loadgen --clients 64 --duration 120s --workload put-all
-```
-
-Option B (miss reads):
-
-```bash
-./build/kv-loadgen --clients 64 --duration 120s --workload get-all
-```
-
-Expect:
-
-* `iostat`: `%util` high (70–100%), `await` higher (ms→tens of ms)
-* `mpstat`: `%iowait` noticeable; CPU not saturated
-* `pidstat`: large `kB_wr/s` (put-all) **or** large `kB_rd/s` (get-all)
-* Loadgen: lower throughput; rising tail latencies
-
-> Make writes more I/O-bound (optional): in `src/database.cpp`, set `PRAGMA synchronous=FULL;` and rebuild.
+* “During `get-popular`, CPU usage on core 0 is ~95% while disk `%util` is low (~5–10%).”
+* “During `get-all`, CPU usage is moderate but `iostat` shows disk `%util` near 100%.”
 
 ---
 
-## 10) Full load-testing matrix (for your report)
+## 11. Summary
 
-Run **≥5 client levels** for **≥5 minutes** per workload.
+This project implements:
 
-Example:
+* A RESTful KV server with HTTP + cache + DB
+* A configurable, pinned-core experimental setup
+* Automated scripts to collect and visualize performance metrics
+* Clear CPU-bound and IO-bound workloads for analysis
+* Optional live monitoring using `mpstat`, `iostat`, and `pidstat`
 
-```bash
-# CPU-bound series
-for C in 8 16 32 64 128; do
-  ./build/kv-loadgen --clients $C --duration 300s --workload get-popular --keys 500
-done
+Follow the steps in order:
 
-# I/O-bound series
-for C in 8 16 32 64 128; do
-  ./build/kv-loadgen --clients $C --duration 300s --workload put-all
-done
-```
+1. Set up PostgreSQL
+2. Build the code
+3. Test basic PUT/GET/DELETE with `curl` and `kv-client`
+4. Run pinned server + DB on cores 0–1
+5. Run pinned loadgen on cores 2–3 with `run_all_workloads.sh`
+6. Use `plot_results.py` to generate plots
+7. Use `mpstat`, `iostat`, and `pidstat` to validate CPU- vs IO-bound behavior
+8. Interpret `get-popular` as CPU-bound and `get-all` as IO-bound using throughput, latency, and resource utilization
 
-Capture monitors during runs:
-
-```bash
-mkdir -p results
-mpstat -P ALL 5   > results/mpstat.txt &
-iostat -dx 5      > results/iostat.txt &
-pidstat -r -u -d -h -p "$SERVER_PID" 5 > results/pidstat.txt &
-# kill them with `kill <pid>` when done (use `jobs -l` to see pids)
-```
-
-**What to include in deliverables**
-
-* Plots: **Throughput vs Clients** and **Avg Latency vs Clients** (per workload)
-* Capacity estimate (plateau point; where latency curve bends up)
-* Bottleneck analysis with evidence:
-
-  * CPU-bound: high CPU, low disk util
-  * I/O-bound: high disk util/await, moderate CPU, high rd/wr rates
-* (Optional) cache hit rate if you add a `/metrics` endpoint
-
-### Optional plotting script
-
-If you used the CSV script earlier, you can generate graphs with:
-
-```bash
-python3 scripts/plot_results.py results/summary_*.csv
-```
+You’ll have everything you need for the DECS project report and demo.
 
 ---
 
-## 11) Tests
+## 12. License
 
-Build with tests:
+This project is intended primarily for educational use as part of the CS744 DECS course.
 
-```bash
-rm -rf build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
-cmake --build build -j"$(nproc)"
-cd build
-ctest --output-on-failure
+Unless otherwise specified by your course or institution, you may treat this code as released under the **MIT License**:
+
+```text
+MIT License
+
+Copyright (c) 2025 Veenu Chhabra
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
-
-* `test-cache` – LRU behavior, eviction, erase
-* `test-database` – CRUD & upsert on SQLite
-* `test-server` – starts HTTP server; hits CRUD routes
-
----
-
-## 12) Troubleshooting
-
-* **`httplib.h` not found**
-  Ensure CMake added its include dir; our `CMakeLists.txt` sets:
-
-  * `FetchContent_MakeAvailable(httplib)`
-  * `target_include_directories(<targets> SYSTEM PRIVATE ${httplib_SOURCE_DIR})`
-
-* **IntelliSense shows `#error "Define one DB backend"`**
-  CMake defines `DB_BACKEND_SQLITE` at build time. Point VS Code to compile commands:
-  `C_Cpp.default.compileCommands = ${workspaceFolder}/build/compile_commands.json`
-  Or add a fallback define for IntelliSense only.
-
-* **Multiple `main` errors**
-  Ensure only these files contain `main()`:
-
-  * `src/main.cpp`, `client/client.cpp`, `loadgen/loadgen_main.cpp`, `tests/*.cpp` (test mains)
-
-* **No binaries when running from `build/`**
-  Use `./kv-server`, `./kv-client`, `./kv-loadgen` (drop the extra `build/` prefix if already inside `build/`).
-
-* **Monitors missing**
-  Install `sysstat`: `sudo apt-get install -y sysstat`.
-
----
-
-## 13) Project layout (abridged)
-
-```
-.
-├── CMakeLists.txt
-├── config/
-│   └── server_config.json
-├── include/
-│   ├── cache.h
-│   ├── config.h
-│   ├── database.h
-│   ├── server.h
-│   ├── utils.h
-│   └── load_generator.h
-├── src/
-│   ├── cache.cpp
-│   ├── config.cpp
-│   ├── database.cpp
-│   ├── main.cpp
-│   ├── server.cpp
-│   └── utils.cpp
-├── client/
-│   └── client.cpp
-├── loadgen/
-│   ├── load_generator.cpp
-│   └── loadgen_main.cpp
-├── tests/
-│   ├── test_cache.cpp
-│   ├── test_database.cpp
-│   └── test_server.cpp
-└── scripts/ (optional helpers)
-```
-
----
-
-## 14) License & notes
-
-* The project uses **cpp-httplib** (MIT) and **nlohmann/json** (MIT).
-* SQLite is included via system packages.
 
